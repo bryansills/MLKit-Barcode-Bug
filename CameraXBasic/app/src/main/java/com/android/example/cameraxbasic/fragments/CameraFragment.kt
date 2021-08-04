@@ -22,10 +22,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.res.Configuration
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.hardware.display.DisplayManager
-import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -34,7 +34,6 @@ import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.webkit.MimeTypeMap
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraInfoUnavailableException
@@ -47,7 +46,6 @@ import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
-import androidx.core.net.toFile
 import androidx.core.view.setPadding
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
@@ -65,19 +63,28 @@ import com.android.example.cameraxbasic.utils.ANIMATION_SLOW_MILLIS
 import com.android.example.cameraxbasic.utils.simulateClick
 import com.bumptech.glide.Glide
 import com.bumptech.glide.request.RequestOptions
+import com.google.mlkit.vision.barcode.Barcode
+import com.google.mlkit.vision.barcode.BarcodeScannerOptions
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.common.InputImage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.tasks.await
 import java.io.File
 import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.ArrayDeque
 import java.util.Locale
+import java.util.concurrent.Executor
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.collections.ArrayList
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+
 
 /** Helper type alias used for analysis use case callbacks */
 typealias LumaListener = (luma: Double) -> Unit
@@ -405,44 +412,45 @@ class CameraFragment : Fragment() {
                         .build()
 
                 // Setup image capture listener which is triggered after photo has been taken
-                imageCapture.takePicture(
-                        outputOptions, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
-                    override fun onError(exc: ImageCaptureException) {
-                        Log.e(TAG, "Photo capture failed: ${exc.message}", exc)
-                    }
-
-                    override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                        val savedUri = output.savedUri ?: Uri.fromFile(photoFile)
-                        Log.d(TAG, "Photo capture succeeded: $savedUri")
-
-                        // We can only change the foreground Drawable using API level 23+ API
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                            // Update the gallery thumbnail with latest picture taken
-                            setGalleryThumbnail(savedUri)
-                        }
-
-                        // Implicit broadcasts will be ignored for devices running API level >= 24
-                        // so if you only target API level 24+ you can remove this statement
-                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
-                            requireActivity().sendBroadcast(
-                                    Intent(android.hardware.Camera.ACTION_NEW_PICTURE, savedUri)
-                            )
-                        }
-
-                        // If the folder selected is an external media directory, this is
-                        // unnecessary but otherwise other apps will not be able to access our
-                        // images unless we scan them using [MediaScannerConnection]
-                        val mimeType = MimeTypeMap.getSingleton()
-                                .getMimeTypeFromExtension(savedUri.toFile().extension)
-                        MediaScannerConnection.scanFile(
-                                context,
-                                arrayOf(savedUri.toFile().absolutePath),
-                                arrayOf(mimeType)
-                        ) { _, uri ->
-                            Log.d(TAG, "Image capture scanned into media store: $uri")
-                        }
-                    }
-                })
+//                imageCapture.takePicture(
+//                        outputOptions, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
+//                    override fun onError(exc: ImageCaptureException) {
+//                        Log.e(TAG, "Photo capture failed: ${exc.message}", exc)
+//                    }
+//
+//                    override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+//                        val savedUri = output.savedUri ?: Uri.fromFile(photoFile)
+//                        Log.d(TAG, "Photo capture succeeded: $savedUri")
+//
+//                        // We can only change the foreground Drawable using API level 23+ API
+//                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+//                            // Update the gallery thumbnail with latest picture taken
+//                            setGalleryThumbnail(savedUri)
+//                        }
+//
+//                        // Implicit broadcasts will be ignored for devices running API level >= 24
+//                        // so if you only target API level 24+ you can remove this statement
+//                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+//                            requireActivity().sendBroadcast(
+//                                    Intent(android.hardware.Camera.ACTION_NEW_PICTURE, savedUri)
+//                            )
+//                        }
+//
+//                        // If the folder selected is an external media directory, this is
+//                        // unnecessary but otherwise other apps will not be able to access our
+//                        // images unless we scan them using [MediaScannerConnection]
+//                        val mimeType = MimeTypeMap.getSingleton()
+//                                .getMimeTypeFromExtension(savedUri.toFile().extension)
+//                        MediaScannerConnection.scanFile(
+//                                context,
+//                                arrayOf(savedUri.toFile().absolutePath),
+//                                arrayOf(mimeType)
+//                        ) { _, uri ->
+//                            Log.d(TAG, "Image capture scanned into media store: $uri")
+//                        }
+//                    }
+//                })
+                takePictureAndFindBarcode()
 
                 // We can only change the foreground Drawable using API level 23+ API
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -483,6 +491,33 @@ class CameraFragment : Fragment() {
                         requireActivity(), R.id.fragment_container
                 ).navigate(CameraFragmentDirections
                         .actionCameraToGallery(outputDirectory.absolutePath))
+            }
+        }
+    }
+
+    private fun takePictureAndFindBarcode() {
+        lifecycleScope.launch {
+            try {
+                val imageProxy = imageCapture!!.takePicture(cameraExecutor)
+
+                val result = imageProxy.image?.let { mediaImage ->
+                    val mlkitImage = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+
+                    // Temporary workaround
+//                    val buffer: ByteBuffer = mediaImage.planes[0].buffer
+//                    val bytes = ByteArray(buffer.capacity())
+//                    buffer.get(bytes)
+//                    val bitmapImage = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, null)
+//                    val mlkitImage = InputImage.fromBitmap(bitmapImage, imageProxy.imageInfo.rotationDegrees)
+
+                    val barcodeScannerOptions = BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build()
+                    val scanner = BarcodeScanning.getClient(barcodeScannerOptions)
+
+                    scanner.process(mlkitImage).await()
+                }
+                Log.d("TEMP", result.toString())
+            } catch (ex: Exception) {
+                Log.d("TEMP", "Something went wrong.", ex)
             }
         }
     }
@@ -607,3 +642,16 @@ class CameraFragment : Fragment() {
                         .format(System.currentTimeMillis()) + extension)
     }
 }
+
+private suspend fun ImageCapture.takePicture(executor: Executor): ImageProxy =
+    suspendCancellableCoroutine { cont ->
+        this.takePicture(executor, object : ImageCapture.OnImageCapturedCallback() {
+            override fun onCaptureSuccess(image: ImageProxy) {
+                cont.resume(image)
+            }
+
+            override fun onError(exception: ImageCaptureException) {
+                cont.resumeWithException(exception)
+            }
+        })
+    }
